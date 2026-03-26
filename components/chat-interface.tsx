@@ -132,6 +132,17 @@ export function ChatInterface() {
     setMessages((prev) => [...prev, userMessage]);
     setIsLoading(true);
 
+    // 创建AI消息的占位符
+    const aiMessageId = (Date.now() + 1).toString();
+    const aiMessage: Message = {
+      id: aiMessageId,
+      content: '',
+      isUser: false,
+      timestamp: new Date(),
+    };
+
+    setMessages((prev) => [...prev, aiMessage]);
+
     try {
       const response = await fetch('/api/chat', {
         method: 'POST',
@@ -144,57 +155,117 @@ export function ChatInterface() {
         }),
       });
 
-      const data = await response.json();
-
       if (!response.ok) {
-        throw new Error(data.error || 'Failed to get AI response');
+        const errorData = await response.json().catch(() => ({ error: 'Failed to get AI response' }));
+        throw new Error(errorData.error || 'Failed to get AI response');
       }
 
-      const aiResponse: Message = {
-        id: (Date.now() + 1).toString(),
-        content: data.response || 'I received your message but got an empty response.',
-        isUser: false,
-        timestamp: new Date(),
-      };
+      if (!response.body) {
+        throw new Error('No response body');
+      }
 
-      setMessages((prev) => [...prev, aiResponse]);
-      
-      // 如果这是新对话，更新 activeChatId
-      if (data.chatId && data.chatId !== activeChatId) {
-        setActiveChatId(data.chatId);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let fullResponse = '';
+      let currentChatId = activeChatId;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // 解码数据并添加到缓冲区
+        buffer += decoder.decode(value, { stream: true });
         
-        // 重新加载聊天列表
-        const chatsResponse = await fetch('/api/chats');
-        if (chatsResponse.ok) {
-          const chatsData = await chatsResponse.json();
-          setChats(chatsData.chats);
-        }
-      } else {
-        // 更新现有聊天的最后消息
-        setChats((prev) =>
-          prev.map((chat) =>
-            chat.id === activeChatId
-              ? {
-                  ...chat,
-                  lastMessage: content.length > 50 ? content.substring(0, 47) + '...' : content,
-                  timestamp: new Date(),
-                  messageCount: chat.messageCount + 2,
+        // 按行分割缓冲区
+        const lines = buffer.split('\n');
+        
+        // 保留最后一行（可能不完整）
+        buffer = lines.pop() || '';
+        
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) continue;
+          
+          if (trimmedLine.startsWith('data: ')) {
+            const data = trimmedLine.slice(6);
+            
+            // 跳过空数据
+            if (!data) continue;
+            
+            try {
+              const parsed = JSON.parse(data);
+              
+              if (parsed.type === 'chunk' && parsed.content) {
+                // 更新AI消息内容
+                fullResponse += parsed.content;
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === aiMessageId
+                      ? { ...msg, content: fullResponse }
+                      : msg
+                  )
+                );
+              } else if (parsed.type === 'complete' && parsed.chatId) {
+                // 流完成，更新chatId
+                currentChatId = parsed.chatId;
+                
+                // 如果这是新对话，更新 activeChatId
+                if (currentChatId && currentChatId !== activeChatId) {
+                  setActiveChatId(currentChatId);
+                  
+                  // 重新加载聊天列表
+                  const chatsResponse = await fetch('/api/chats');
+                  if (chatsResponse.ok) {
+                    const chatsData = await chatsResponse.json();
+                    setChats(chatsData.chats);
+                  }
+                } else {
+                  // 更新现有聊天的最后消息
+                  setChats((prev) =>
+                    prev.map((chat) =>
+                      chat.id === currentChatId
+                        ? {
+                            ...chat,
+                            lastMessage: content.length > 50 ? content.substring(0, 47) + '...' : content,
+                            timestamp: new Date(),
+                            messageCount: chat.messageCount + 2,
+                          }
+                        : chat
+                    )
+                  );
                 }
-              : chat
-          )
-        );
+                // 流完成，退出循环
+                return;
+              } else if (parsed.type === 'error') {
+                throw new Error(parsed.error || 'Stream processing error');
+              }
+            } catch (parseError) {
+              console.error('Error parsing SSE data:', parseError, data);
+            }
+          }
+        }
+      }
+      
+      // 如果循环结束但没有收到完成信号，手动触发完成
+      if (fullResponse) {
+        // 保存响应到数据库（通过API的完成信号已经处理）
+        console.log('Stream completed without explicit complete signal');
       }
     } catch (error) {
       console.error('Error getting AI response:', error);
       
-      const errorResponse: Message = {
-        id: (Date.now() + 1).toString(),
-        content: `Sorry, I encountered an error: ${error instanceof Error ? error.message : 'Unknown error'}. Please check your API key configuration and try again.`,
-        isUser: false,
-        timestamp: new Date(),
-      };
-      
-      setMessages((prev) => [...prev, errorResponse]);
+      // 更新错误消息
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === aiMessageId
+            ? { 
+                ...msg, 
+                content: `Sorry, I encountered an error: ${error instanceof Error ? error.message : 'Unknown error'}. Please check your API key configuration and try again.`
+              }
+            : msg
+        )
+      );
     } finally {
       setIsLoading(false);
     }
